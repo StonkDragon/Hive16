@@ -14,10 +14,17 @@ Hive16 is a simple 16-bit RISC architecture.
 - 16-bit data bus
 
 ## Memory Map
-!!! TODO
+- 0x0000 - 0xFFFB: General purpose memory/program space
+  - 0xC000 - 0xCFFF: Stack space
+- 0xFFFC - 0xFFFD: Reset vector
+- 0xFFFE - 0xFFFF: Interrupt vector
 
 ## Interrupts
-!!! TODO
+- The Hive16 architecture has a single interrupt vector at 0xFFFE.
+- The interrupt vector is a 16-bit address that is jumped to when an interrupt is triggered.
+- The interrupt vector is only jumped to if the interrupt enable flag (I) is set.
+- Before jumping to the interrupt vector, the current program counter and flags are pushed onto the stack.
+- Use `popf` followed by `ret` to return from an interrupt.
 
 ## Instructions
 | Name | Encoding | Approx. Cycles | Psuedo Code |
@@ -89,3 +96,25 @@ Hive16 is a simple 16-bit RISC architecture.
 | ne | 100 | Z == 0 |
 | ge | 101 | N == 0 |
 | gt | 110 | (N == 0) and (Z == 0) |
+
+## Built-In sequences
+### Reset sequence
+```asm
+    clri            ; I = 0, disable interrupts
+    ldi sp 0xff     ; sp = 0xcfff
+    ldui sp 0xcf
+    ldi pc 0xfc     ; pc = 0xfffc
+    ldui pc 0xff
+    ld pc pc        ; pc = [0xfffc]
+    setr            ; R = 1, run flag
+```
+
+### Interrupt sequence
+```asm
+    push pc         ; push pc
+    pushf           ; push flags
+    clri            ; I = 0, disable interrupts
+    ldi pc 0xfe     ; pc = 0xfffe
+    ldui pc 0xff
+    ld pc pc        ; pc = [0xfffe]
+```

@@ -19,11 +19,26 @@ struct cpu {
 
     unsigned char interrupt:1;
 
+#if defined(DEBUG) && DEBUG == 1
+    #define FETCH8(cpu, addr) (fetch_barrier((cpu), (addr)), (cpu)->memory[(addr)] & 0xFF)
+    #define STORE8(cpu, addr, value) (store_barrier((cpu), (addr), (value)), (cpu)->memory[(addr)] = (value) & 0xFF)
+#else
     #define FETCH8(cpu, addr) ((cpu)->memory[(addr)] & 0xFF)
-    #define FETCH16(cpu, addr) (((cpu)->memory[(addr)] & 0xFF) | (((unsigned short) (cpu)->memory[(addr) + 1]) << 8))
     #define STORE8(cpu, addr, value) ((cpu)->memory[(addr)] = (value) & 0xFF)
-    #define STORE16(cpu, addr, value) ((cpu)->memory[(addr)] = (value) & 0xFF, (cpu)->memory[(addr) + 1] = ((value) >> 8) & 0xFF)
+#endif
+#define FETCH16(cpu, addr) (FETCH8((cpu), (addr)) | (((unsigned short) FETCH8((cpu), (addr) + 1)) << 8))
+#define STORE16(cpu, addr, value) (STORE8((cpu), (addr), (value) & 0xFF), STORE8((cpu), (addr) + 1, (value) >> 8))
 };
+
+unsigned char fetch_barrier(struct cpu* cpu, unsigned short addr) {
+    printf("Fetching 0x%04hx: 0x%02hhx\n", addr, cpu->memory[addr]);
+    return 0;
+}
+
+unsigned char store_barrier(struct cpu* cpu, unsigned short addr, unsigned char value) {
+    printf("Storing 0x%04hx: 0x%02hhx -> 0x%02hhx\n", addr, cpu->memory[addr], value);
+    return 0;
+}
 
 union instruction {
     struct {
@@ -226,6 +241,9 @@ void abort_if_false(int condition, const char* message) {
 
 #define OP_misc         0x1c
 #define OP_misc_flags   0x00
+#define OP_misc_int     0x01
+#define OP_misc_pushf   0x02
+#define OP_misc_popf    0x03
 
 #define OP_ret          0x1c
 #define OP_nop          0x1d
@@ -575,14 +593,22 @@ char* disassemble_op(union instruction instr, unsigned short pc) {
                             break;
                     }
                     break;
+                case OP_misc_int:
+                    return strformat("int");
+                    break;
+                case OP_misc_pushf:
+                    return strformat("pushf");
+                    break;
+                case OP_misc_popf:
+                    return strformat("popf");
+                    break;
             }
             break;
     }
     return NULL;
 }
 
-void cycle(struct cpu* cpu) {
-    union instruction opcode;
+void exec(struct cpu* cpu, union instruction opcode) {
     unsigned char op;
     unsigned char Rd;
     unsigned char Rn;
@@ -596,14 +622,11 @@ void cycle(struct cpu* cpu) {
     unsigned char cond;
     unsigned short address;
     unsigned short result;
+    unsigned char flags;
     int runInstr;
 #if defined(DEBUG) && DEBUG == 1
     char* disassembled;
 #endif
-    
-    /* fetch the opcode from memory */
-    opcode.raw = FETCH16(cpu, cpu->PC);
-    cpu->PC += 2;
 
     /* decode the opcode */
     op = opcode.imm.opcode;
@@ -923,6 +946,22 @@ void cycle(struct cpu* cpu) {
                         }
                     }
                     break;
+                case OP_misc_int:
+                    cpu->interrupt = 1;
+                    break;
+                case OP_misc_pushf:
+                    flags = (cpu->Z << 3) | (cpu->N << 2) | (cpu->I << 1) | cpu->R;
+                    STORE16(cpu, cpu->SP, flags);
+                    cpu->SP -= 2;
+                    break;
+                case OP_misc_popf:
+                    flags = FETCH16(cpu, cpu->SP);
+                    cpu->SP += 2;
+                    cpu->Z = (flags >> 3) & 1;
+                    cpu->N = (flags >> 2) & 1;
+                    cpu->I = (flags >> 1) & 1;
+                    cpu->R = flags & 1;
+                    break;
                 default:
                     fprintf(stderr, "Invalid misc operation: %d\n", opcode.misc.misc_op);
                     exit(1);
@@ -935,6 +974,16 @@ void cycle(struct cpu* cpu) {
             exit(1);
             break;
     }
+}
+
+void cycle(struct cpu* cpu) {
+    union instruction opcode;
+    
+    /* fetch the opcode from memory */
+    opcode.raw = FETCH16(cpu, cpu->PC);
+    cpu->PC += 2;
+
+    exec(cpu, opcode);
 }
 
 struct token {
@@ -995,75 +1044,61 @@ char* drop_last(const char* str, long int len) {
     return newStr;
 }
 
-union instruction* parse(char* fileData, long int* count) {
-    long int line;
-    union instruction* instructions;
-    long int instructionCount;
-    long int instructionCapacity;
-    struct token* tokens;
-    long int tokenCount;
-    long int tokenCapacity;
-    struct {
-        char* name;
-        char type;
-        #define TYPE_IMM11 1
-        #define TYPE_IMM8 2
-        unsigned short where;
-    }* relocs;
-    long int relocCount;
-    long int relocCapacity;
-    struct {
-        char* name;
-        unsigned short where;
-    }* labels;
-    long int labelCount;
-    long int labelCapacity;
+void abort_with(const char* message) {
+    fprintf(stderr, "%s\n", message);
+    abort();
+}
 
-    long int i;
-    char* end;
+#define array(type) struct { type* data; long int count; long int capacity; }
+#define emptyArray(type) (type) {0}
+#define push(arr, ...) do { if ((arr).count == (arr).capacity) { (arr).capacity = (arr).capacity == 0 ? 16 : (arr).capacity * 2; (arr).data = realloc((arr).data, (arr).capacity * sizeof(*(arr).data)); if ((arr).data == NULL) { fprintf(stderr, "Failed to allocate memory\n"); exit(1); } } (arr).data[(arr).count++] = (__VA_ARGS__); } while (0)
+#define pop(arr) (arr).data[--(arr).count]
+#define top(arr) (arr).data[(arr).count - 1]
+#define free_array(arr) do { if ((arr).data) { free((arr).data); (arr).data = NULL; } } while (0)
+
+struct reloc {
+    char* name;
+    enum type {
+        TYPE_IMM11 = 1,
+        TYPE_IMM8  = 2,
+        TYPE_RAW   = 4,
+        TYPE_LDI   = 8,
+        TYPE_LDUI  = 16
+    } type;
+    unsigned short where;
+};
+struct label {
+    char* name;
+    unsigned short where;
+};
+
+typedef array(union instruction) instructionArray;
+typedef array(struct token) tokenArray;
+typedef array(struct reloc) relocArray;
+typedef array(struct label) labelArray;
+
+instructionArray parse(char* fileData) {
+    long int line = 1;
+    instructionArray instructions = {0};
+    tokenArray tokens = {0};
+    relocArray relocs = {0};
+    labelArray labels = {0};
+    
+    struct token token = {0};
+    union instruction instr = {0};
+    struct reloc reloc = {0};
+    struct label label = {0};
+
+    long int i = 0;
+    char* end = NULL;
+
+    unsigned short tmp;
 
     if (fileData == NULL) {
         printf("File data is NULL\n");
-        return NULL;
+        return emptyArray(instructionArray);
     }
-    if (count == NULL) {
-        printf("Count is NULL\n");
-        return NULL;
-    }
-
-    tokenCount = 0;
-    tokenCapacity = 16;
-    tokens = malloc(tokenCapacity * sizeof(struct token));
-    if (tokens == NULL) {
-        printf("Failed to allocate memory\n");
-        return NULL;
-    }
-
-    instructionCount = 0;
-    instructionCapacity = 16;
-    instructions = malloc(instructionCapacity * sizeof(union instruction));
-    if (instructions == NULL) {
-        printf("Failed to allocate memory\n");
-        return NULL;
-    }
-
-    relocCount = 0;
-    relocCapacity = 16;
-    relocs = malloc(relocCapacity * sizeof(*relocs));
-    if (relocs == NULL) {
-        printf("Failed to allocate memory\n");
-        return NULL;
-    }
-
-    labelCount = 0;
-    labelCapacity = 16;
-    labels = malloc(labelCapacity * sizeof(*labels));
-    if (labels == NULL) {
-        printf("Failed to allocate memory\n");
-        return NULL;
-    }
-
-    line = 1;
+    
     while (*fileData) {
         if (*fileData == '\n') {
             line++;
@@ -1079,574 +1114,610 @@ union instruction* parse(char* fileData, long int* count) {
             continue;
         }
 
-        if (tokenCount == tokenCapacity) {
-            tokenCapacity *= 2;
-            tokens = realloc(tokens, tokenCapacity * sizeof(struct token));
-            if (tokens == NULL) {
-                printf("Failed to allocate memory\n");
-                return NULL;
-            }
-        }
         if (*fileData == '-' || (*fileData >= '0' && *fileData <= '9')) {
-            tokens[tokenCount].type = TOKEN_NUMBER;
+            token.type = TOKEN_NUMBER;
         } else {
-            tokens[tokenCount].type = TOKEN_IDENT;
+            token.type = TOKEN_IDENT;
         }
         
         for (i = 0; (fileData[i] != ' ' && fileData[i] != '\t' && fileData[i] != '\n' && fileData[i] != ';') && fileData[i]; i++);
         end = fileData + i;
-        tokens[tokenCount].value = malloc(i + 1);
+        token.value = malloc(i + 1);
         i = 0;
         do {
-            tokens[tokenCount].value[i++] = *fileData++;
+            token.value[i++] = *fileData++;
         } while (fileData != end);
 
-        tokens[tokenCount].value[i] = '\0';
-        tokens[tokenCount].line = line;
-        tokens[tokenCount].len = i;
-        tokenCount++;
+        token.value[i] = '\0';
+        token.line = line;
+        token.len = i;
+
+        push(tokens, token);
+        token = (struct token) {0};
     }
 
-    for (i = 0; i < tokenCount; i++) {
-        union instruction instr;
-        
-        if (instructionCount == instructionCapacity) {
-            instructionCapacity *= 2;
-            instructions = realloc(instructions, instructionCapacity * sizeof(union instruction));
-            if (instructions == NULL) {
-                printf("Failed to allocate memory\n");
-                return NULL;
-            }
-        }
-
-        #define incr(i, tokenCount) do { (i)++; if ((i) >= (tokenCount)) { fprintf(stderr, "Unexpected end of file\n"); exit(1); } } while (0)
+    for (i = 0; i < tokens.count; i++) {
+        #define incr(i, max) do { (i)++; if ((i) >= (max)) { fprintf(stderr, "Unexpected end of file\n"); exit(1); } } while (0)
         #define check(f, v) do { if (!(f)(v)) { fprintf(stderr, "Expected constraint %s to be true for %s\n", #f, v); exit(1); } } while (0)
+        #define expect(expected, v) do { if (tokens.data[i].type != (expected) || tokens.data[i].value == NULL) { fprintf(stderr, "Expected a %s\n", (v)); exit(1); } } while (0)
 
-        if (tokens[i].type != TOKEN_IDENT || tokens[i].value == NULL) {
+        if (tokens.data[i].type != TOKEN_IDENT || tokens.data[i].value == NULL) {
             fprintf(stderr, "Expected an identifier\n");
             exit(1);
         }
 
-        if (tokens[i].value[tokens[i].len - 1] == ':') {
-            if (labelCount == labelCapacity) {
-                labelCapacity *= 2;
-                labels = realloc(labels, labelCapacity * sizeof(*labels));
-                if (labels == NULL) {
-                    printf("Failed to allocate memory\n");
-                    return NULL;
+        if (tokens.data[i].value[tokens.data[i].len - 1] == ':') {
+            
+            label.name = drop_last(tokens.data[i].value, tokens.data[i].len);
+            if (label.name == NULL) {
+                fprintf(stderr, "Failed to allocate memory\n");
+                return emptyArray(instructionArray);
+            }
+            label.where = instructions.count;
+            push(labels, label);
+            label = (struct label) {0};
+            continue;
+        } else if (tokens.data[i].value[0] == '.') {
+            if (equals(tokens.data[i].value, ".org")) {
+                incr(i, tokens.count);
+                expect(TOKEN_NUMBER, "number");
+
+                tmp = parse_unsigned(tokens.data[i].value);
+                if (tmp % 2 != 0) {
+                    fprintf(stderr, "Address must be even\n");
+                    exit(1);
                 }
+                tmp /= 2;
+
+                instr.raw = 0;
+                while (instructions.count < tmp) {
+                    push(instructions, instr);
+                }
+            } else if (equals(tokens.data[i].value, ".word")) {
+                incr(i, tokens.count);
+                if (tokens.data[i].type == TOKEN_NUMBER) {
+                    instr.raw = parse_unsigned(tokens.data[i].value);
+                } else {
+                    reloc.name = tokens.data[i].value;
+                    reloc.type = TYPE_RAW;
+                    reloc.where = instructions.count;
+                    push(relocs, reloc);
+                    reloc = (struct reloc) {0};
+                    instr.raw = 0;
+                }
+                push(instructions, instr);
+            } else if (equals(tokens.data[i].value, ".byte")) {
+                incr(i, tokens.count);
+                expect(TOKEN_NUMBER, "number");
+
+                instr.raw = parse_unsigned(tokens.data[i].value) & 0xFF;
+                push(instructions, instr);
+            } else {
+                fprintf(stderr, "Unknown directive: %s\n", tokens.data[i].value);
+                exit(1);
             }
-            labels[labelCount].name = drop_last(tokens[i].value, tokens[i].len);
-            if (labels[labelCount].name == NULL) {
-                printf("Failed to allocate memory\n");
-                return NULL;
-            }
-            labels[labelCount].where = instructionCount;
-            labelCount++;
+            instr = (union instruction) {0};
             continue;
         }
 
         instr.raw = 0;
 
-        if (equals(tokens[i].value, "add")) {
+        if (equals(tokens.data[i].value, "add")) {
             instr.tri_reg.opcode = OP_add;
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "sub")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "sub")) {
             instr.tri_reg.opcode = OP_sub;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "cmp")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "cmp")) {
             instr.tri_reg.opcode = OP_sub;
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
             
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
 
             instr.tri_reg.discardRes = 1;
-        } else if (equals(tokens[i].value, "mul")) {
+        } else if (equals(tokens.data[i].value, "mul")) {
             instr.tri_reg.opcode = OP_mul;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "div")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "div")) {
             instr.tri_reg.opcode = OP_div;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "mod")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "mod")) {
             instr.tri_reg.opcode = OP_mod;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "divs")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "divs")) {
             instr.tri_reg.opcode = OP_div;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
 
             instr.tri_reg.isSigned = 1;
-        } else if (equals(tokens[i].value, "mods")) {
+        } else if (equals(tokens.data[i].value, "mods")) {
             instr.tri_reg.opcode = OP_mod;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);            
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);            
 
             instr.tri_reg.isSigned = 1;
-        } else if (equals(tokens[i].value, "and")) {
+        } else if (equals(tokens.data[i].value, "and")) {
             instr.tri_reg.opcode = OP_and;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "tst")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "tst")) {
             instr.tri_reg.opcode = OP_and;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
 
             instr.tri_reg.discardRes = 1;
-        } else if (equals(tokens[i].value, "or")) {
+        } else if (equals(tokens.data[i].value, "or")) {
             instr.tri_reg.opcode = OP_or;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "xor")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "xor")) {
             instr.tri_reg.opcode = OP_xor;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "not")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "not")) {
             instr.tri_reg.opcode = OP_not;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "lsl")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "lsl")) {
             instr.tri_reg.opcode = OP_lsl;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "lsr")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "lsr")) {
             instr.tri_reg.opcode = OP_lsr;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "asr")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "asr")) {
             instr.tri_reg.opcode = OP_lsr;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rm = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rm = parse_register(tokens.data[i].value);
 
             instr.tri_reg.isSigned = 1;
-        } else if (equals(tokens[i].value, "mov")) {
+        } else if (equals(tokens.data[i].value, "mov")) {
             instr.tri_reg.opcode = OP_mov;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "inc")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "inc")) {
             instr.tri_reg.opcode = OP_inc;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "dec")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "dec")) {
             instr.tri_reg.opcode = OP_dec;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "ldi")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "ldi")) {
             instr.reg_imm.opcode = OP_ldi;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.reg_imm.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.reg_imm.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            instr.reg_imm.imm8 = parse_signed(tokens[i].value);
-        } else if (equals(tokens[i].value, "ldui")) {
+            incr(i, tokens.count);
+            if (tokens.data[i].type == TOKEN_NUMBER) {
+                instr.reg_imm.imm8 = parse_signed(tokens.data[i].value);
+            } else {
+                reloc.name = tokens.data[i].value;
+                reloc.type = TYPE_LDI;
+                reloc.where = instructions.count;
+                
+                push(relocs, reloc);
+                reloc = (struct reloc) {0};
+            }
+        } else if (equals(tokens.data[i].value, "ldui")) {
             instr.reg_imm.opcode = OP_ldui;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.reg_imm.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.reg_imm.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            instr.reg_imm.imm8 = parse_signed(tokens[i].value);
-        } else if (equals(tokens[i].value, "ld")) {
+            incr(i, tokens.count);
+            if (tokens.data[i].type == TOKEN_NUMBER) {
+                instr.reg_imm.imm8 = parse_signed(tokens.data[i].value);
+            } else {
+                reloc.name = tokens.data[i].value;
+                reloc.type = TYPE_LDUI;
+                reloc.where = instructions.count;
+                
+                push(relocs, reloc);
+                reloc = (struct reloc) {0};
+            }
+        } else if (equals(tokens.data[i].value, "ld")) {
             instr.tri_reg.opcode = OP_ld;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            if (i + 1 < tokenCount && is_register(tokens[i + 1].value)) {
-                incr(i, tokenCount);
-                instr.tri_reg.Rm = parse_register(tokens[i].value);
+            if (i + 1 < tokens.count && is_register(tokens.data[i + 1].value)) {
+                incr(i, tokens.count);
+                instr.tri_reg.Rm = parse_register(tokens.data[i].value);
                 instr.tri_reg.isSigned = 1;
             }
-        } else if (equals(tokens[i].value, "st")) {
+        } else if (equals(tokens.data[i].value, "st")) {
             instr.tri_reg.opcode = OP_st;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            if (i + 1 < tokenCount && is_register(tokens[i + 1].value)) {
-                incr(i, tokenCount);
-                instr.tri_reg.Rm = parse_register(tokens[i].value);
+            if (i + 1 < tokens.count && is_register(tokens.data[i + 1].value)) {
+                incr(i, tokens.count);
+                instr.tri_reg.Rm = parse_register(tokens.data[i].value);
                 instr.tri_reg.isSigned = 1;
             }
-        } else if (equals(tokens[i].value, "ldb")) {
+        } else if (equals(tokens.data[i].value, "ldb")) {
             instr.tri_reg.opcode = OP_ldb;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            if (i + 1 < tokenCount && is_register(tokens[i + 1].value)) {
-                incr(i, tokenCount);
-                instr.tri_reg.Rm = parse_register(tokens[i].value);
+            if (i + 1 < tokens.count && is_register(tokens.data[i + 1].value)) {
+                incr(i, tokens.count);
+                instr.tri_reg.Rm = parse_register(tokens.data[i].value);
                 instr.tri_reg.isSigned = 1;
             }
-        } else if (equals(tokens[i].value, "stb")) {
+        } else if (equals(tokens.data[i].value, "stb")) {
             instr.tri_reg.opcode = OP_stb;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rn = parse_register(tokens[i].value);
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rn = parse_register(tokens.data[i].value);
 
-            if (i + 1 < tokenCount && is_register(tokens[i + 1].value)) {
-                incr(i, tokenCount);
-                instr.tri_reg.Rm = parse_register(tokens[i].value);
+            if (i + 1 < tokens.count && is_register(tokens.data[i + 1].value)) {
+                incr(i, tokens.count);
+                instr.tri_reg.Rm = parse_register(tokens.data[i].value);
                 instr.tri_reg.isSigned = 1;
             }
-        } else if (equals(tokens[i].value, "push")) {
+        } else if (equals(tokens.data[i].value, "push")) {
             instr.tri_reg.opcode = OP_push;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "pop")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "pop")) {
             instr.tri_reg.opcode = OP_pop;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "ret")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "ret")) {
             instr.tri_reg.opcode = OP_pop;
 
             instr.tri_reg.Rd = 7;
-        } else if (equals(tokens[i].value, "jmp")) {
+        } else if (equals(tokens.data[i].value, "jmp")) {
             instr.imm.opcode = OP_jmp;
 
-            incr(i, tokenCount);
-            if (tokens[i].type == TOKEN_NUMBER) {
-                instr.imm.simm11 = parse_signed(tokens[i].value);
+            incr(i, tokens.count);
+            if (tokens.data[i].type == TOKEN_NUMBER) {
+                instr.imm.simm11 = parse_signed(tokens.data[i].value);
             } else {
-                if (relocCount == relocCapacity) {
-                    relocCapacity *= 2;
-                    relocs = realloc(relocs, relocCapacity * sizeof(*relocs));
-                    if (relocs == NULL) {
-                        printf("Failed to allocate memory\n");
-                        return NULL;
-                    }
-                }
-
-                relocs[relocCount].name = tokens[i].value;
-                relocs[relocCount].type = TYPE_IMM11;
-                relocs[relocCount].where = instructionCount;
-                relocCount++;
+                reloc.name = tokens.data[i].value;
+                reloc.type = TYPE_IMM11;
+                reloc.where = instructions.count;
+                
+                push(relocs, reloc);
+                reloc = (struct reloc) {0};
             }
-        } else if (equals(tokens[i].value, "jr")) {
+        } else if (equals(tokens.data[i].value, "jr")) {
             instr.tri_reg.opcode = OP_jr;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (equals(tokens[i].value, "call")) {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (equals(tokens.data[i].value, "call")) {
             instr.imm.opcode = OP_call;
 
-            incr(i, tokenCount);
-            if (tokens[i].type == TOKEN_NUMBER) {
-                instr.imm.simm11 = parse_signed(tokens[i].value);
+            incr(i, tokens.count);
+            if (tokens.data[i].type == TOKEN_NUMBER) {
+                instr.imm.simm11 = parse_signed(tokens.data[i].value);
             } else {
-                if (relocCount == relocCapacity) {
-                    relocCapacity *= 2;
-                    relocs = realloc(relocs, relocCapacity * sizeof(*relocs));
-                    if (relocs == NULL) {
-                        printf("Failed to allocate memory\n");
-                        return NULL;
-                    }
-                }
-
-                relocs[relocCount].name = tokens[i].value;
-                relocs[relocCount].type = TYPE_IMM11;
-                relocs[relocCount].where = instructionCount;
-                relocCount++;
+                reloc.name = tokens.data[i].value;
+                reloc.type = TYPE_IMM11;
+                reloc.where = instructions.count;
+                
+                push(relocs, reloc);
+                reloc = (struct reloc) {0};
             }
-        } else if (equals(tokens[i].value, "callr")) {
+        } else if (equals(tokens.data[i].value, "callr")) {
             instr.tri_reg.opcode = OP_callr;
 
-            incr(i, tokenCount);
-            check(is_register, tokens[i].value);
-            instr.tri_reg.Rd = parse_register(tokens[i].value);
-        } else if (tokens[i].value[0] == 'j') {
-            if (tokens[i].value[1] == 'r') {
+            incr(i, tokens.count);
+            check(is_register, tokens.data[i].value);
+            instr.tri_reg.Rd = parse_register(tokens.data[i].value);
+        } else if (tokens.data[i].value[0] == 'j') {
+            if (tokens.data[i].value[1] == 'r') {
                 instr.cond_reg.opcode = OP_jrcc;
 
-                instr.cond_reg.cond = parse_condition(tokens[i].value + 2);
+                instr.cond_reg.cond = parse_condition(tokens.data[i].value + 2);
 
-                incr(i, tokenCount);
-                check(is_register, tokens[i].value);
-                instr.cond_reg.Rd = parse_register(tokens[i].value);
+                incr(i, tokens.count);
+                check(is_register, tokens.data[i].value);
+                instr.cond_reg.Rd = parse_register(tokens.data[i].value);
             } else {
                 instr.cond_imm.opcode = OP_jcc;
 
-                instr.cond_imm.cond = parse_condition(tokens[i].value + 1);
+                instr.cond_imm.cond = parse_condition(tokens.data[i].value + 1);
 
-                incr(i, tokenCount);
-                if (tokens[i].type == TOKEN_NUMBER) {
-                    instr.cond_imm.simm8 = parse_signed(tokens[i].value);
+                incr(i, tokens.count);
+                if (tokens.data[i].type == TOKEN_NUMBER) {
+                    instr.cond_imm.simm8 = parse_signed(tokens.data[i].value);
                 } else {
-                    if (relocCount == relocCapacity) {
-                        relocCapacity *= 2;
-                        relocs = realloc(relocs, relocCapacity * sizeof(*relocs));
-                        if (relocs == NULL) {
-                            printf("Failed to allocate memory\n");
-                            return NULL;
-                        }
-                    }
-
-                    relocs[relocCount].name = tokens[i].value;
-                    relocs[relocCount].type = TYPE_IMM8;
-                    relocs[relocCount].where = instructionCount;
-                    relocCount++;
+                    reloc.name = tokens.data[i].value;
+                    reloc.type = TYPE_IMM8;
+                    reloc.where = instructions.count;
+                    
+                    push(relocs, reloc);
+                    reloc = (struct reloc) {0};
                 }
             }
-        } else if (equals(tokens[i].value, "clrz")) {
+        } else if (equals(tokens.data[i].value, "clrz")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 0;
-        } else if (equals(tokens[i].value, "setz")) {
+        } else if (equals(tokens.data[i].value, "setz")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 1;
-        } else if (equals(tokens[i].value, "clrn")) {
+        } else if (equals(tokens.data[i].value, "clrn")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 2;
-        } else if (equals(tokens[i].value, "setn")) {
+        } else if (equals(tokens.data[i].value, "setn")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 3;
-        } else if (equals(tokens[i].value, "clri")) {
+        } else if (equals(tokens.data[i].value, "clri")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 4;
-        } else if (equals(tokens[i].value, "seti")) {
+        } else if (equals(tokens.data[i].value, "seti")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 5;
-        } else if (equals(tokens[i].value, "halt")) {
+        } else if (equals(tokens.data[i].value, "halt") || equals(tokens.data[i].value, "clrr")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 6;
-        } else if (equals(tokens[i].value, "nop")) {
+        } else if (equals(tokens.data[i].value, "nop") || equals(tokens.data[i].value, "setr")) {
             instr.misc.opcode = OP_misc;
             instr.misc.misc_op = OP_misc_flags;
             instr.misc.arg1 = 7;
+        } else if (equals(tokens.data[i].value, "int")) {
+            instr.misc.opcode = OP_misc;
+            instr.misc.misc_op = OP_misc_int;
+        } else if (equals(tokens.data[i].value, "pushf")) {
+            instr.misc.opcode = OP_misc;
+            instr.misc.misc_op = OP_misc_pushf;
+        } else if (equals(tokens.data[i].value, "popf")) {
+            instr.misc.opcode = OP_misc;
+            instr.misc.misc_op = OP_misc_popf;
         } else {
-            fprintf(stderr, "Unknown instruction: %s\n", tokens[i].value);
+            fprintf(stderr, "Unknown instruction: %s\n", tokens.data[i].value);
             exit(1);
         }
 
-        instructions[instructionCount] = instr;
-        instructionCount++;
+        push(instructions, instr);
+        instr = (union instruction) {0};
     }
 
-    for (i = 0; i < relocCount; i++) {
+    for (i = 0; i < relocs.count; i++) {
         long int j;
-        for (j = 0; j < labelCount; j++) {
-            if (strcmp(relocs[i].name, labels[j].name) == 0) {
-                unsigned short currentLocation = relocs[i].where + 1; /* when executing the instruction the PC is already incremented */
-                signed short diff = labels[j].where - currentLocation;
-                if (relocs[i].type == TYPE_IMM8) {
-                    if (diff < -256 || diff > 255) {
-                        fprintf(stderr, "Label %s is too far away from instruction at %d\n", relocs[i].name, relocs[i].where);
-                        exit(1);
-                    }
-                    instructions[relocs[i].where].cond_imm.simm8 = diff;
-                } else {
-                    if (diff < -1024 || diff > 1023) {
-                        fprintf(stderr, "Label %s is too far away from instruction at %d\n", relocs[i].name, relocs[i].where);
-                        exit(1);
-                    }
-                    instructions[relocs[i].where].imm.simm11 = diff;
+        for (j = 0; j < labels.count; j++) {
+            if (strcmp(relocs.data[i].name, labels.data[j].name) == 0) {
+                unsigned short currentLocation = relocs.data[i].where + 1; /* when executing the instruction the PC is already incremented */
+                signed short diff = labels.data[j].where - currentLocation;
+                switch (relocs.data[i].type) {
+                    case TYPE_IMM11:
+                        if (diff < -1024 || diff > 1023) {
+                            fprintf(stderr, "Label %s is too far away from instruction at %d\n", relocs.data[i].name, relocs.data[i].where);
+                            exit(1);
+                        }
+                        instructions.data[relocs.data[i].where].imm.simm11 = diff;
+                        break;
+                    case TYPE_IMM8:
+                        if (diff < -256 || diff > 255) {
+                            fprintf(stderr, "Label %s is too far away from instruction at %d\n", relocs.data[i].name, relocs.data[i].where);
+                            exit(1);
+                        }
+                        instructions.data[relocs.data[i].where].cond_imm.simm8 = diff;
+                        break;
+                    case TYPE_RAW:
+                        instructions.data[relocs.data[i].where].raw = labels.data[j].where * 2;
+                        break;
+                    case TYPE_LDI:
+                        instructions.data[relocs.data[i].where].reg_imm.imm8 = (labels.data[j].where * 2) & 0xFF;
+                        break;
+                    case TYPE_LDUI:
+                        instructions.data[relocs.data[i].where].reg_imm.imm8 = ((labels.data[j].where * 2) >> 8) & 0xFF;
+                        break;
                 }
                 break;
             }
         }
-        if (j == labelCount) {
-            fprintf(stderr, "Undefined label: %s\n", relocs[i].name);
+        if (j == labels.count) {
+            fprintf(stderr, "Undefined label: %s\n", relocs.data[i].name);
             exit(1);
         }
     }
 
-    *count = instructionCount;
     return instructions;
 }
 
@@ -1654,11 +1725,10 @@ int assemble(const char* f) {
     char* data;
     unsigned long int size;
     FILE* file;
-    union instruction* instructions;
-    long int count;
+    instructionArray instructions;
     int i;
     
-    file = fopen(f, "r");
+    file = fopen(f, "rb");
     if (!file) {
         fprintf(stderr, "Failed to open %s\n", f);
         return 1;
@@ -1694,8 +1764,8 @@ int assemble(const char* f) {
     }
     fclose(file);
 
-    instructions = parse(data, &count);
-    if (!instructions) {
+    instructions = parse(data);
+    if (!instructions.data) {
         fprintf(stderr, "Failed to parse file\n");
         return 1;
     }
@@ -1706,8 +1776,8 @@ int assemble(const char* f) {
         return 1;
     }
 
-    for (i = 0; i < count; i++) {
-        if (fwrite(&instructions[i], sizeof(union instruction), 1, file) != 1) {
+    for (i = 0; i < instructions.count; i++) {
+        if (fwrite(&instructions.data[i], sizeof(union instruction), 1, file) != 1) {
             fprintf(stderr, "Failed to write to program.bin\n");
             return 1;
         }
@@ -1722,12 +1792,38 @@ int assemble(const char* f) {
 void run(struct cpu* cpu) {
 #if defined(DEBUG) && DEBUG == 1
     int emptyLines;
-    unsigned long int i;
     unsigned long int j;
 #endif
+    unsigned long int i;
 
-    cpu->R = 1;
+    union instruction setup[] = {
+        {.misc = {.opcode = OP_misc, .misc_op = OP_misc_flags, .arg1 = 0x0 | 0x4}}, /* clri */
+        {.reg_imm = {.opcode = OP_ldi, .Rd = 6, .imm8 = 0xff}}, /* ldi sp 0xff */
+        {.reg_imm = {.opcode = OP_ldui, .Rd = 6, .imm8 = 0xcf}}, /* ldui sp 0xcf */
+        {.reg_imm = {.opcode = OP_ldi, .Rd = 7, .imm8 = 0xfc}}, /* ldi pc 0xfc */
+        {.reg_imm = {.opcode = OP_ldui, .Rd = 7, .imm8 = 0xff}}, /* ldui pc 0xff */
+        {.tri_reg = {.opcode = OP_ld, .Rd = 7, .Rn = 7}}, /* ld pc pc */
+        {.misc = {.opcode = OP_misc, .misc_op = OP_misc_flags, .arg1 = 0x1 | 0x6}}, /* nop, important: sets run flag */
+    };
+    union instruction onInterrupt[] = {
+        {.tri_reg = {.opcode = OP_push, .Rd = 7}}, /* push pc */
+        {.misc = {.opcode = OP_misc, .misc_op = OP_misc_pushf}}, /* pushf */
+        {.misc = {.opcode = OP_misc, .misc_op = OP_misc_flags, .arg1 = 0x0 | 0x4}}, /* clri */
+        {.reg_imm = {.opcode = OP_ldi, .Rd = 7, .imm8 = 0xfe}}, /* ldi pc 0xfe */
+        {.reg_imm = {.opcode = OP_ldui, .Rd = 7, .imm8 = 0xff}}, /* ldui pc 0xff */
+        {.tri_reg = {.opcode = OP_ld, .Rd = 7, .Rn = 7}}, /* ld pc pc */
+    };
+
+    for (i = 0; !cpu->R; i++) {
+        exec(cpu, setup[i]);
+    }
+
     while (cpu->R) {
+        if (cpu->I && cpu->interrupt) {
+            for (i = 0; i < sizeof(onInterrupt) / sizeof(union instruction); i++) {
+                exec(cpu, onInterrupt[i]);
+            }
+        }
         cycle(cpu);
     }
 
@@ -1876,7 +1972,7 @@ int disassemble(const char* f) {
         printf("0x%04lx: ", i * 2);
         i++;
         char* instrStr = disassemble_op(instr, i * 2);
-        printf("%s\n", instrStr);
+        printf("0x%04hx %s\n", instr.raw, instrStr);
         check_free(&instrStr);
     }
 

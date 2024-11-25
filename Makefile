@@ -6,3 +6,6 @@ build-debug:
 
 build-release:
 	clang main.c -pedantic -std=c99 -o h16 -Wall -Wextra -O3
+
+help:
+	@echo "Usage: make [build|build-debug|build-release|help]"
