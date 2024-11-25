@@ -20,7 +20,7 @@ struct cpu {
     unsigned char interrupt:1;
 
     #define FETCH8(cpu, addr) ((cpu)->memory[(addr)] & 0xFF)
-    #define FETCH16(cpu, addr) (((cpu)->memory[(addr)] & 0xFF) | ((cpu)->memory[(addr) + 1] << 8))
+    #define FETCH16(cpu, addr) (((cpu)->memory[(addr)] & 0xFF) | (((unsigned short) (cpu)->memory[(addr) + 1]) << 8))
     #define STORE8(cpu, addr, value) ((cpu)->memory[(addr)] = (value) & 0xFF)
     #define STORE16(cpu, addr, value) ((cpu)->memory[(addr)] = (value) & 0xFF, (cpu)->memory[(addr) + 1] = ((value) >> 8) & 0xFF)
 };
