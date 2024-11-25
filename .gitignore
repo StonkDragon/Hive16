@@ -1,3 +1,4 @@
 *.bin
 h16
 *.log
+.vscode
