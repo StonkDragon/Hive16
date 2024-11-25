@@ -63,7 +63,9 @@ union instruction {
     unsigned short raw;
 };
 
-#define const_assert(expr, msg) struct { int static_assertion_failed : !!(expr); } __attribute__((unused)) static_assertion_failed = { 0 }
+#define CONCAT0(a, b) a ## b
+#define CONCAT(a, b) CONCAT0(a, b)
+#define const_assert(expr, msg) struct { int static_assertion_failed : !!(expr); } __attribute__((unused)) CONCAT(static_assertion_failed_at_line_, __LINE__) = { 0 }
 
 const_assert(sizeof(union instruction) == 2, "Instruction size is not 2 bytes");
 
