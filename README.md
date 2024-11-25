@@ -74,6 +74,9 @@ Hive16 is a simple 16-bit RISC architecture.
 | seti | `11100  00 000  101  --- ` | 1 | I = 1 |
 | halt | `11100  00 000  110  --- ` | 1 | R = 0 |
 | nop | `11100  00 000  111  --- ` | 1 | R = 1 |
+| int | `11100  00 001  ---  --- ` | 1 | if (I) interrupt |
+| pushf | `11100  00 010  ---  --- ` | 1 | [--sp] = flags |
+| popf | `11100  00 011  ---  --- ` | 1 | flags = [sp++] |
 
 ## Registers
 | Name | Encoding |

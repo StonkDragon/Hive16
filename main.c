@@ -947,7 +947,7 @@ void exec(struct cpu* cpu, union instruction opcode) {
                     }
                     break;
                 case OP_misc_int:
-                    cpu->interrupt = 1;
+                    if (cpu->I) cpu->interrupt = 1;
                     break;
                 case OP_misc_pushf:
                     flags = (cpu->Z << 3) | (cpu->N << 2) | (cpu->I << 1) | cpu->R;
