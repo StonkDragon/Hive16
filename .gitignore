@@ -2,3 +2,4 @@
 h16
 *.log
 .vscode
+*.dSYM
